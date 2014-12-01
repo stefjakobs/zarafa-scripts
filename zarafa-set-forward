@@ -1,0 +1,168 @@
+#!/usr/bin/python -u
+
+# Copyright (c) Stefan Jakobs <projects AT localside.net>
+#####################################################################
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <http://www.gnu.org/licenses/>.
+######################################################################
+
+import getopt
+import binascii
+import __builtin__
+
+try:
+	import MAPI
+	from MAPI.Util import *
+	from MAPI.Time import *
+	from MAPI.Struct import *
+except ImportError, e:
+	print "Not all modules can be loaded. The following modules are required:"
+	print "- MAPI (Zarafa)"
+	print ""
+	print e
+	sys.exit(1)
+
+def print_help():
+	print "Usage: %s -u [username of mailbox] -m [mail destination]" % sys.argv[0]
+	print ""
+	print "Create rule for forwarding of mail"
+	print ""
+	print "Required arguments:"
+	print "   -u, --user          user to set forwarding rule"
+	print "   -m, --mail          mail address to forward to"
+	print "   -h, --host          Host to connect with. Default: file:///var/run/zarafa"
+	print "   -s, --sslkey-file   SSL key file to authenticate as admin. Default: /etc/zarafa/ssl/client.pem"
+	print "   -p, --sslkey-pass   Password for the SSL key file."
+	print ""
+	print "optional arguments:"
+	print "   --help              Show this help message and exit."
+
+def UnixTimeToCOleDateTime(unixtime):
+    days = (float(unixtime)/(60*60*24))+25569
+    cOleDateTime = struct.pack("d", days)
+    return cOleDateTime
+
+def main(argv = None):
+	if argv is None:
+		argv = sys.argv
+
+	try:
+		opts, args = getopt.gnu_getopt(argv, 'u:m:h:s:p:', ['user=', 'mail=', 'host=', 'sslkey-file=', 'sslkey-pass='])
+	except getopt.GetoptError, err:
+		# print help information and exit:
+		print str(err)
+		print ""
+		print_help()
+		return 1
+
+	host = 'file:///var/run/zarafa'
+	sslkey_file = '/etc/zarafa/ssl/client.pem'
+	sslkey_pass = None
+	username = None
+	mail = None
+
+	for o, a in opts:
+		if o in ('-h', '--host'):
+		    host = a
+		elif o in ('-s', '--sslkey-file'):
+		    sslkey_file = a
+		elif o in ('-p', '--sslkey-pass'):
+		    sslkey_pass = a
+		elif o in ('-u', '--user'):
+		    username = a
+		elif o in ('-m', '--mail'):
+		    mail = a
+		elif o == '--help':
+		    print_help()
+		    return 0
+		else:
+		    assert False, ("unhandled option '%s'" % o)
+
+	if not username:
+		print "No username specified."
+		print ""
+		print_help()
+		sys.exit(1)
+
+	if not mail:
+		print "No e-mail address specified."
+		print ""
+		print_help()
+		sys.exit(1)
+
+	try:
+		session = OpenECSession(username, '', host, sslkey_file = sslkey_file, sslkey_pass = sslkey_pass)
+		store = GetDefaultStore(session)
+		inboxeid = store.GetReceiveFolder('IPM', 0)[0]
+		inbox = store.OpenEntry(inboxeid, None, MAPI_BEST_ACCESS)
+		rules = inbox.OpenProperty(PR_RULES_TABLE, IID_IExchangeModifyTable, 0, 0)
+
+
+		p = store.GetProps([PR_STORE_ENTRYID, PR_IPM_WASTEBASKET_ENTRYID], 0)
+		storeid = p[0].Value
+		wasteid = p[1].Value
+		waste = store.OpenEntry(wasteid, None, MAPI_BEST_ACCESS)
+		waste.EmptyFolder(0, None, 0)
+
+	except MAPIError, err:
+		if err.hr == MAPI_E_LOGON_FAILED:
+		    print "Failed to logon. Make sure your credentials are correct."
+		elif err.hr == MAPI_E_NETWORK_ERROR:
+		    print "Unable to connect to server. Make sure you specified the correct server."
+		else:
+		    print "Unexpected error occurred. hr=0x%08x" % err.hr
+		sys.exit(1)
+
+
+	# forward to known user
+	#username = 'user3'
+	#ab = session.OpenAddressBook(0, None, 0)
+	#gab = ab.OpenEntry(ab.GetDefaultDir(), None, 0)
+	#(names, flags) = gab.ResolveNames([PR_ENTRYID, PR_ADDRTYPE, PR_DISPLAY_NAME, PR_EMAIL_ADDRESS], 0,
+	#                                       [[SPropValue(PR_DISPLAY_NAME, username), SPropValue(PR_RECIPIENT_TYPE, MAPI_TO)]], [MAPI_UNRESOLVED])
+
+	# forward to arbitrary email address
+	names = [[
+	    SPropValue(PR_DISPLAY_NAME, mail), 
+	    SPropValue(PR_EMAIL_ADDRESS, mail), 
+	    SPropValue(PR_SMTP_ADDRESS, mail), 
+	    SPropValue(PR_ADDRTYPE, 'SMTP'), 
+	    SPropValue(PR_RECIPIENT_TYPE, 1),
+	    SPropValue(PR_OBJECT_TYPE, 6),
+	    SPropValue(PR_SEARCH_KEY, 'SMTP:%s\x00' % mail)
+	]]
+
+	provider_data = struct.pack("<LL", 1, 1) + UnixTimeToCOleDateTime(time.time())
+	# add rule
+	condition = SContentRestriction(FL_SUBSTRING|FL_IGNORECASE, PR_SUBJECT, SPropValue(PR_SUBJECT, ''))
+	action = ACTIONS(EDK_RULES_VERSION,
+			     [ ACTION(ACTTYPE.OP_FORWARD, 0x00000003, None, None, 0, actFwdDelegate(names) ),
+			       ACTION(ACTTYPE.OP_DELETE, 0, None, None, 0, None) ] )
+			       # move item to 'deleted objects'
+                #ACTION(ACTTYPE.OP_MOVE, 0, None, None, 0, actMoveCopy(storeid, wasteid)) ] )
+
+	rules.ModifyTable(0, [ ROWENTRY(ROW_ADD,
+				 [   SPropValue(PR_RULE_LEVEL, 0),
+				     SPropValue(PR_RULE_NAME, "Mail-Redirect"),
+				     SPropValue(PR_RULE_PROVIDER, "RuleOrganizer"),
+				     SPropValue(PR_RULE_PROVIDER_DATA, provider_data),
+				     SPropValue(PR_RULE_STATE, ST_ENABLED),
+				     SPropValue(PR_RULE_SEQUENCE, 1),
+				     SPropValue(PR_RULE_CONDITION, condition),
+				     SPropValue(PR_RULE_ACTIONS, action)
+				 ]
+				 ) ] )
+
+if __name__ == '__main__':
+    #locale.setlocale(locale.LC_ALL, '')
+    sys.exit(main())
